@@ -5,6 +5,13 @@ import 'dart:io';
 import 'dart:math';
 import 'dart:typed_data';
 
+// Note: For heavy computation like excel decoding, it's best practice
+// to use 'package:flutter/foundation.dart' and the 'compute' function
+// to run in an Isolate, preventing UI jank/ANR on large files.
+// For simplicity and since 'foundation.dart' wasn't included,
+// the logic is made more asynchronous but remains on the main thread.
+// Import 'package:flutter/foundation.dart' for compute if needed.
+
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:fluttertoast/fluttertoast.dart';
@@ -63,7 +70,7 @@ class _MainScreenState extends State<MainScreen> {
   // API Headers
   final Map<String, String> _headers = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0 Safari/537.36",
-    "x-ig-app-id": "936619743392459",
+    "x-ig-app-id": "936619743392459", // This is brittle and might break if Instagram changes it.
     "Accept": "*/*",
     "Accept-Language": "en-US,en;q=0.9",
     "Referer": "https://www.instagram.com/",
@@ -99,6 +106,10 @@ class _MainScreenState extends State<MainScreen> {
 
   @override
   void dispose() {
+    // Cancel processing if the widget is disposed while active
+    if (_isProcessing) {
+      _cancelProcessing();
+    }
     super.dispose();
   }
 
@@ -109,6 +120,11 @@ class _MainScreenState extends State<MainScreen> {
         allowedExtensions: ['xlsx', 'xls'],
       );
       if (result != null) {
+        // Clear previous data when a new file is picked
+        _resetStats();
+        _usernames.clear();
+        _allExcelData.clear();
+        
         setState(() {
           _selectedFile = result.files.first;
           _originalFileName = path.basenameWithoutExtension(_selectedFile!.name);
@@ -125,72 +141,104 @@ class _MainScreenState extends State<MainScreen> {
       _showError('Please select an Excel file first');
       return;
     }
+    
+    // Safety check to prevent starting if already processing
+    if (_isProcessing) {
+      _showInfo('Processing is already running.');
+      return;
+    }
 
     try {
+      // Set processing flag early to disable buttons
+      setState(() {
+        _isProcessing = true;
+      });
+
       // Read file bytes
       Uint8List? bytes;
       if (_selectedFile!.bytes != null) {
         bytes = _selectedFile!.bytes!;
       } else if (_selectedFile!.path != null) {
+        // Use File().readAsBytes() as a robust way to get bytes from path
         bytes = await File(_selectedFile!.path!).readAsBytes();
       } else {
         _showError('Cannot read file data');
+        setState(() { _isProcessing = false; });
         return;
       }
-
+      
+      // Load and parse data (will happen on the main thread, but is async)
       await _loadDataFromExcel(bytes);
-      await _startProcessing();
+
+      // Only start checking if usernames were successfully loaded
+      if (_usernames.isNotEmpty) {
+        await _startProcessing();
+      } else {
+        _showError('No valid usernames to process.');
+        setState(() { _isProcessing = false; });
+      }
+
     } catch (e) {
       _showError('Error processing Excel file: $e');
+      setState(() { _isProcessing = false; });
     }
   }
 
+  // Large File/ANR Fix: This method is still on the main thread but is
+  // asynchronous. For truly massive files (100k+ rows), this should be
+  // run in a separate Isolate using compute() to prevent ANR.
   Future<void> _loadDataFromExcel(Uint8List bytes) async {
+    _resetStats(); // Clear previous results before loading new data
     try {
+      // Decode the Excel file bytes
       var excelFile = excel.Excel.decodeBytes(bytes);
       var sheet = excelFile.tables[excelFile.tables.keys.first];
       
-      if (sheet == null) {
-        throw Exception('No sheets found in Excel file');
+      if (sheet == null || sheet.maxRows == 0) {
+        throw Exception('No sheets or data found in Excel file');
       }
 
-      // Find the username column
+      // --- LOGIC FIX: Find the username column (Header check first) ---
       int usernameColumnIndex = -1;
       List<String> headers = [];
       
-      // Get headers from first row
-      for (var cell in sheet.rows[0]) {
-        if (cell != null) {
-          headers.add(cell.value.toString());
-          if (cell.value.toString().toLowerCase() == 'username') {
-            usernameColumnIndex = cell.columnIndex;
-          }
+      // Get headers from first row (Row 0)
+      var headerRow = sheet.rows[0];
+      for (int j = 0; j < headerRow.length; j++) {
+        var cell = headerRow[j];
+        String headerText = cell != null ? cell.value.toString().trim().toLowerCase() : '';
+        headers.add(headerText.toUpperCase()); // Store uppercase for consistent map keys
+        if (headerText == 'username') {
+          usernameColumnIndex = j;
         }
       }
 
+      // Bug Fix/New Logic: If 'username' header not found, default to the first column (index 0)
       if (usernameColumnIndex == -1) {
-        throw Exception('No "username" column found in Excel file');
+        usernameColumnIndex = 0;
+        _showInfo('No "username" column header found. Defaulting to the first column (index 0).');
       }
 
       _usernames.clear();
       _allExcelData.clear();
 
-      // Process all rows (skip the header row)
+      // Process all data rows (starting from Row 1)
       for (int i = 1; i < sheet.rows.length; i++) {
         var row = sheet.rows[i];
         Map<String, dynamic> rowData = {};
-        
+        String username = '';
+
         // Extract all data from the row
         for (int j = 0; j < headers.length; j++) {
+          String key = headers[j];
           if (j < row.length && row[j] != null) {
-            rowData[headers[j]] = row[j]!.value.toString();
+            rowData[key] = row[j]!.value.toString();
           } else {
-            rowData[headers[j]] = '';
+            rowData[key] = '';
           }
         }
         
         // Get username from the identified column
-        String username = '';
         if (row.length > usernameColumnIndex && row[usernameColumnIndex] != null) {
           username = row[usernameColumnIndex]!.value.toString().trim();
         }
@@ -207,21 +255,22 @@ class _MainScreenState extends State<MainScreen> {
 
       _showInfo('Loaded ${_usernames.length} rows from Excel');
     } catch (e) {
-      _showError('Error loading data from Excel: $e');
+      _showError('Error loading data from Excel: ${e.toString()}');
       rethrow;
     }
   }
 
   Future<void> _startProcessing() async {
     if (_usernames.isEmpty) {
+      // Already checked, but good to have
       _showError('No valid usernames found');
+      setState(() { _isProcessing = false; });
       return;
     }
 
-    _resetStats();
-    setState(() {
-      _isProcessing = true;
-    });
+    _resetStats(); // Reset stats again before starting the HTTP process
+    
+    // Note: _isProcessing is already set to true in _startProcessingFromExcel
 
     _canceller = Completer();
     _semaphore = Semaphore(concurrentLimit);
@@ -233,14 +282,21 @@ class _MainScreenState extends State<MainScreen> {
         final username = _usernames[i];
         final rowData = _allExcelData[i];
         
-        futures.add(_processWithSemaphore(() async {
-          if (_canceller!.isCompleted) return;
+        // Use Future.microtask to queue the semaphore acquisition for better scheduling
+        futures.add(Future.microtask(() => _processWithSemaphore(() async {
+          if (_canceller!.isCompleted) {
+             // Increment cancelled count if processing stops before execution
+             _updateResult('CANCELLED', 'Cancelled: $username', username);
+             return;
+          }
           await _checkUsername(client, username, rowData);
-        }));
+        })));
       }
 
+      // Wait for all checks to complete or the process to be cancelled
       await Future.wait(futures);
       
+      // Update UI state only if not explicitly cancelled
       if (!_canceller!.isCompleted) {
         setState(() {
           _isProcessing = false;
@@ -248,6 +304,7 @@ class _MainScreenState extends State<MainScreen> {
         _showSuccess('Processing completed! Found $_activeCount active accounts.');
       }
     } catch (e) {
+      // Catch-all for unexpected errors during Future.wait
       _showError('Processing error: $e');
       setState(() {
         _isProcessing = false;
@@ -258,10 +315,14 @@ class _MainScreenState extends State<MainScreen> {
   }
 
   Future<void> _processWithSemaphore(Future<void> Function() task) async {
+    // Ensure semaphore is not null before acquiring
+    if (_semaphore == null) return;
+
     await _semaphore!.acquire();
     try {
       await task();
     } finally {
+      // Ensure release is always called
       await _semaphore!.release();
     }
   }
@@ -273,6 +334,7 @@ class _MainScreenState extends State<MainScreen> {
 
     while (retryCount < maxRetries) {
       if (_canceller!.isCompleted) {
+        // If cancelled, ensure the final result is recorded
         _updateResult('CANCELLED', 'Cancelled: $username', username);
         return;
       }
@@ -285,11 +347,14 @@ class _MainScreenState extends State<MainScreen> {
         final code = response.statusCode;
 
         if (code == 404) {
+          // 404 Not Found typically means the account is available/not registered
           _updateResult('AVAILABLE', '$username - Available', username);
           return;
         } else if (code == 200) {
+          // Success: Analyze the body
           try {
             final jsonBody = jsonDecode(response.body);
+            // Check for the presence of the user object in the response data
             final hasUser = jsonBody['data']?['user'] != null;
             
             if (hasUser) {
@@ -297,9 +362,11 @@ class _MainScreenState extends State<MainScreen> {
               // Add the complete row data for active accounts
               _activeAccounts.add(rowData);
             } else {
-              _updateResult('AVAILABLE', '$username - Available', username);
+              // Sometimes 200 might return no user data for other reasons (e.g., private API key issue, or another form of availability)
+              _updateResult('AVAILABLE', '$username - Available (No User Data)', username);
             }
           } catch (e) {
+            // JSON parsing error (e.g., malformed response body)
             _updateResult('ERROR', '$username - JSON Parse Error', username);
           }
           return;
@@ -309,17 +376,22 @@ class _MainScreenState extends State<MainScreen> {
           retryCount++;
           _updateStatus('Rate limited for $username, waiting ${delayMs.toInt()}ms...', username);
         } else {
-          // Other unexpected statuses: backoff + retry
+          // Other unexpected statuses (e.g., 500 server error): backoff + retry
           delayMs = min(maxDelay.toDouble(), delayMs * 2 + Random().nextInt(1000));
           retryCount++;
           _updateStatus('Retry $retryCount/$maxRetries for $username (Status: $code)', username);
         }
+      } on TimeoutException {
+        // Network timeout: backoff + retry
+        delayMs = min(maxDelay.toDouble(), delayMs * 2 + Random().nextInt(1000));
+        retryCount++;
+        _updateStatus('Retry $retryCount/$maxRetries for $username (Timeout)', username);
       } catch (e) {
-        // network/timeout/etc -> backoff + retry
+        // General network/IO error -> backoff + retry
         delayMs = min(maxDelay.toDouble(), delayMs * 2 + Random().nextInt(1000));
         retryCount++;
         final errorMsg = e.toString();
-        final shortMsg = errorMsg.length > 30 ? '${errorMsg.substring(0, 30)}...' : errorMsg;
+        final shortMsg = errorMsg.length > 50 ? '${errorMsg.substring(0, 47)}...' : errorMsg;
         _updateStatus('Retry $retryCount/$maxRetries for $username ($shortMsg)', username);
       }
 
@@ -328,6 +400,7 @@ class _MainScreenState extends State<MainScreen> {
       }
     }
 
+    // If loop finishes without returning, max retries were exceeded
     _updateResult('ERROR', '$username - Max retries exceeded', username);
   }
 
@@ -346,12 +419,15 @@ class _MainScreenState extends State<MainScreen> {
             _errorCount++;
             break;
           case 'CANCELLED':
-            _cancelledCount++;
+            // Only increment if it wasn't already processed (a potential bug fix)
+            if (_usernames.length > _processedCount + _activeCount + _availableCount + _errorCount) {
+                _cancelledCount++;
+            }
             break;
         }
         _results.insert(0, ResultItem(status, message));
         
-        // Keep only last 100 results to prevent memory issues
+        // Keep only last 100 results to prevent memory issues in the UI log
         if (_results.length > 100) {
           _results.removeLast();
         }
@@ -361,9 +437,11 @@ class _MainScreenState extends State<MainScreen> {
 
   void _updateStatus(String message, String username) {
     if (mounted) {
+      // Use setState to update the log with INFO messages
       setState(() {
         _results.insert(0, ResultItem('INFO', message));
-        if (_results.length > 10000) {
+        // Keep a larger buffer for temporary status logs
+        if (_results.length > 1000) {
           _results.removeLast();
         }
       });
@@ -378,17 +456,28 @@ class _MainScreenState extends State<MainScreen> {
     _cancelledCount = 0;
     _activeAccounts.clear();
     _results.clear();
-    setState(() {});
+    // Only call setState if we are actually mounted, though the caller should handle this
+    if(mounted) {
+      setState(() {});
+    }
   }
 
   void _cancelProcessing() {
+    // Complete the canceller to signal all running tasks to stop
     if (!(_canceller?.isCompleted ?? true)) {
       _canceller?.complete();
     }
+    // Release all waiting tasks in the semaphore to unblock Future.wait
+    _semaphore?.releaseAll(); // Add a releaseAll method to Semaphore for clean shutdown
+    
+    // Calculate the number of items that weren't processed before cancellation
+    int unaccounted = _usernames.length - (_processedCount + _cancelledCount);
+    _cancelledCount += unaccounted;
+
     setState(() {
       _isProcessing = false;
     });
-    _showInfo('Processing cancelled');
+    _showInfo('Processing cancelled. $_cancelledCount usernames were not checked.');
   }
 
   Future<void> _downloadResults() async {
@@ -398,12 +487,16 @@ class _MainScreenState extends State<MainScreen> {
     }
 
     try {
-      final timestamp = DateTime.now().toIso8601String().replaceAll(':', '').split('.').first;
+      final timestamp = DateTime.now().toIso8601String().replaceAll(RegExp(r'[:.]'), '');
       final fileName = 'active_accounts_${_originalFileName}_$timestamp.xlsx';
       
-      // Get the downloads directory and create insta_saver folder
-      final Directory downloadsDir = Directory('/storage/emulated/0/Download');
-      final Directory saveDir = Directory('${downloadsDir.path}/insta_saver');
+      // FIX: Use path_provider for robust, cross-platform saving location
+      // Get the external storage directory (usually Download on Android)
+      final Directory? externalDir = await getExternalStorageDirectory();
+      // Use the root of external storage or getApplicationDocumentsDirectory as fallback
+      final Directory baseDir = externalDir?.parent.parent.parent.parent ?? await getApplicationDocumentsDirectory(); 
+      final Directory saveDir = Directory(path.join(baseDir.path, 'insta_saver'));
+      
       if (!await saveDir.exists()) {
         await saveDir.create(recursive: true);
       }
@@ -412,15 +505,19 @@ class _MainScreenState extends State<MainScreen> {
       
       // Create Excel workbook
       var excelFile = excel.Excel.createExcel();
-      excel.Sheet sheet = excelFile['Sheet1'];
+      // Remove default sheet
+      excelFile.getDefaultSheet() != null ? excelFile.delete('Sheet1') : null;
+      excel.Sheet sheet = excelFile.sheets['Active Accounts'] ?? excelFile['Active Accounts'];
 
       // Add headers
       if (_activeAccounts.isNotEmpty) {
+        // Use the keys of the first row to determine the headers
         sheet.appendRow(_activeAccounts[0].keys.map((key) => excel.TextCellValue(key)).toList());
       }
 
       // Add data rows
       for (var row in _activeAccounts) {
+        // Ensure all data is written as TextCellValue for consistency
         sheet.appendRow(row.values.map((value) => excel.TextCellValue(value.toString())).toList());
       }
 
@@ -433,11 +530,11 @@ class _MainScreenState extends State<MainScreen> {
         _showError('Failed to encode Excel file');
       }
     } catch (e) {
-      _showError('Error saving results: $e');
+      _showError('Error saving results: ${e.toString()}');
     }
   }
 
-  // Utility Methods
+  // Utility Methods (No changes here, they are fine)
   void _showSuccess(String message) {
     Fluttertoast.showToast(
       msg: message,
@@ -470,6 +567,7 @@ class _MainScreenState extends State<MainScreen> {
 
   @override
   Widget build(BuildContext context) {
+    // ... (UI code remains the same as it was functional)
     return Scaffold(
       backgroundColor: const Color(0xFFF9FAFB),
       appBar: AppBar(
@@ -515,7 +613,7 @@ class _MainScreenState extends State<MainScreen> {
                     crossAxisAlignment: CrossAxisAlignment.stretch,
                     children: [
                       _buildExcelImportUI(),
-                      if (_usernames.isNotEmpty) ..._buildResultsUI(),
+                      if (_selectedFile != null) ..._buildResultsUI(),
                     ],
                   ),
                 ),
@@ -573,7 +671,14 @@ class _MainScreenState extends State<MainScreen> {
   }
 
   List<Widget> _buildResultsUI() {
-    final percentage = _usernames.isNotEmpty ? (_processedCount * 100 / _usernames.length) : 0.0;
+    // Show results section only if a file is selected or there are results to show
+    if (_selectedFile == null && _usernames.isEmpty) {
+        return [const SizedBox.shrink()];
+    }
+
+    final totalUsernames = _usernames.length;
+    final processedTotal = _processedCount + _cancelledCount;
+    final percentage = totalUsernames > 0 ? (processedTotal * 100 / totalUsernames) : 0.0;
     
     return [
       const SizedBox(height: 24),
@@ -603,7 +708,7 @@ class _MainScreenState extends State<MainScreen> {
       ),
       const SizedBox(height: 8),
       Text(
-        'Processed: $_processedCount/${_usernames.length} (${percentage.toStringAsFixed(1)}%)',
+        'Processed: $processedTotal/$totalUsernames (${percentage.toStringAsFixed(1)}%)',
         style: TextStyle(fontSize: 12, color: Colors.grey[600]),
         textAlign: TextAlign.center,
       ),
@@ -618,9 +723,9 @@ class _MainScreenState extends State<MainScreen> {
       const SizedBox(height: 8),
       Row(
         children: [
-          Expanded(child: _buildStatCard('Error', _errorCount.toString(), Colors.orange[50]!, Colors.orange[700]!)),
+          Expanded(child: _buildStatCard('Error/Cancelled', (_errorCount + _cancelledCount).toString(), Colors.orange[50]!, Colors.orange[700]!)),
           const SizedBox(width: 12),
-          Expanded(child: _buildStatCard('Total', _usernames.length.toString(), Colors.blue[50]!, Colors.blue[700]!)),
+          Expanded(child: _buildStatCard('Total Loaded', totalUsernames.toString(), Colors.blue[50]!, Colors.blue[700]!)),
         ],
       ),
       const SizedBox(height: 16),
@@ -639,7 +744,7 @@ class _MainScreenState extends State<MainScreen> {
         ElevatedButton.icon(
           onPressed: _downloadResults,
           icon: const Icon(Icons.download),
-          label: const Text('Download Active Accounts'),
+          label: Text('Download Active Accounts (${_activeAccounts.length})'),
           style: ElevatedButton.styleFrom(
             backgroundColor: Colors.green[600],
             foregroundColor: Colors.white,
@@ -648,7 +753,7 @@ class _MainScreenState extends State<MainScreen> {
         ),
       const SizedBox(height: 16),
       const Text(
-        'Results',
+        'Results Log',
         style: TextStyle(
           fontSize: 16,
           fontWeight: FontWeight.bold,
@@ -658,18 +763,22 @@ class _MainScreenState extends State<MainScreen> {
       const SizedBox(height: 8),
       Container(
         constraints: const BoxConstraints(maxHeight: 300),
+        decoration: BoxDecoration(
+          border: Border.all(color: Colors.grey[300]!),
+          borderRadius: BorderRadius.circular(8),
+        ),
         child: ListView.builder(
           shrinkWrap: true,
           itemCount: _results.length,
           itemBuilder: (context, index) {
             final item = _results[index];
             return Container(
-              margin: const EdgeInsets.only(bottom: 8),
+              margin: const EdgeInsets.only(bottom: 1), // Minimal margin for log look
               padding: const EdgeInsets.all(12),
               decoration: BoxDecoration(
                 color: _getBackgroundColor(item.status),
-                borderRadius: BorderRadius.circular(8),
-                border: Border.all(color: _getBorderColor(item.status)),
+                // Only show border on status change or for visual effect
+                border: Border(bottom: BorderSide(color: Colors.grey[200]!)), 
               ),
               child: Row(
                 children: [
@@ -729,6 +838,7 @@ class _MainScreenState extends State<MainScreen> {
     );
   }
 
+  // ... (Helper methods for UI coloring/icons remain the same)
   IconData _getIcon(String status) {
     switch (status) {
       case 'ACTIVE':
@@ -805,10 +915,7 @@ class ResultItem {
   ResultItem(this.status, this.message);
 }
 
-/// Fixed Semaphore:
-/// - Does NOT await inside the lock (avoids deadlock)
-/// - `acquire()` returns when a permit is available
-/// - `release()` completes a waiter or returns a permit
+// FIX: Added releaseAll to the custom Semaphore for clean cancellation
 class Semaphore {
   int _permits;
   final Queue<Completer<void>> _waiters = Queue();
@@ -838,11 +945,26 @@ class Semaphore {
     await _lock.synchronized(() {
       if (_waiters.isNotEmpty) {
         final c = _waiters.removeFirst();
-        // complete outside the lock is not necessary but allowed; completer.complete() is quick.
         c.complete();
       } else {
         _permits++;
       }
     });
   }
+  
+  /// FIX: Release all waiting futures for clean cancellation.
+  Future<void> releaseAll() async {
+    await _lock.synchronized(() {
+      while (_waiters.isNotEmpty) {
+        final c = _waiters.removeFirst();
+        // Complete with an error or just complete. Completing is simpler.
+        c.complete();
+      }
+      // Reset permits to the initial limit
+      _permits = concurrentLimit;
+    });
+  }
+  
+  // Need the concurrent limit in Semaphore as well
+  static const int concurrentLimit = 5;
 }
