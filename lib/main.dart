@@ -5,13 +5,6 @@ import 'dart:io';
 import 'dart:math';
 import 'dart:typed_data';
 
-// Note: For heavy computation like excel decoding, it's best practice
-// to use 'package:flutter/foundation.dart' and the 'compute' function
-// to run in an Isolate, preventing UI jank/ANR on large files.
-// For simplicity and since 'foundation.dart' wasn't included,
-// the logic is made more asynchronous but remains on the main thread.
-// Import 'package:flutter/foundation.dart' for compute if needed.
-
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:fluttertoast/fluttertoast.dart';
@@ -20,6 +13,7 @@ import 'package:excel/excel.dart' as excel;
 import 'package:path/path.dart' as path;
 import 'package:synchronized/synchronized.dart';
 import 'package:path_provider/path_provider.dart';
+import 'package:permission_handler/permission_handler.dart'; // REQUIRED
 
 void main() {
   runApp(const MyApp());
@@ -32,6 +26,7 @@ class MyApp extends StatelessWidget {
   Widget build(BuildContext context) {
     return MaterialApp(
       title: 'InstaCheck',
+      debugShowCheckedModeBanner: false,
       theme: ThemeData(
         primarySwatch: Colors.indigo,
         primaryColor: Colors.indigo,
@@ -45,11 +40,13 @@ class MyApp extends StatelessWidget {
         elevatedButtonTheme: ElevatedButtonThemeData(
           style: ElevatedButton.styleFrom(
             padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 16),
-            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+            shape:
+                RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
             elevation: 2,
           ),
         ),
-        colorScheme: ColorScheme.fromSwatch(primarySwatch: Colors.indigo).copyWith(
+        colorScheme: ColorScheme.fromSwatch(primarySwatch: Colors.indigo)
+            .copyWith(
           secondary: Colors.green,
           error: Colors.red,
         ),
@@ -69,8 +66,9 @@ class MainScreen extends StatefulWidget {
 class _MainScreenState extends State<MainScreen> {
   // API Headers
   final Map<String, String> _headers = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0 Safari/537.36",
-    "x-ig-app-id": "936619743392459", // This is brittle and might break if Instagram changes it.
+    "User-Agent":
+        "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Mobile Safari/537.36",
+    "x-ig-app-id": "936619743392459",
     "Accept": "*/*",
     "Accept-Language": "en-US,en;q=0.9",
     "Referer": "https://www.instagram.com/",
@@ -79,9 +77,9 @@ class _MainScreenState extends State<MainScreen> {
   };
 
   // Processing Configuration
-  final int maxRetries = 10;
+  final int maxRetries = 5;
   final int initialDelay = 1000; // milliseconds
-  final int maxDelay = 60000; // milliseconds
+  final int maxDelay = 30000; // milliseconds
   final int concurrentLimit = 5; // Number of concurrent requests
 
   // State Variables
@@ -90,14 +88,14 @@ class _MainScreenState extends State<MainScreen> {
   List<String> _usernames = [];
   List<Map<String, dynamic>> _allExcelData = [];
   List<Map<String, dynamic>> _activeAccounts = [];
-  
+
   // Counters
   int _processedCount = 0;
   int _activeCount = 0;
   int _availableCount = 0;
   int _errorCount = 0;
   int _cancelledCount = 0;
-  
+
   // Processing State
   bool _isProcessing = false;
   Completer<void>? _canceller;
@@ -106,7 +104,6 @@ class _MainScreenState extends State<MainScreen> {
 
   @override
   void dispose() {
-    // Cancel processing if the widget is disposed while active
     if (_isProcessing) {
       _cancelProcessing();
     }
@@ -120,14 +117,14 @@ class _MainScreenState extends State<MainScreen> {
         allowedExtensions: ['xlsx', 'xls'],
       );
       if (result != null) {
-        // Clear previous data when a new file is picked
         _resetStats();
         _usernames.clear();
         _allExcelData.clear();
-        
+
         setState(() {
           _selectedFile = result.files.first;
-          _originalFileName = path.basenameWithoutExtension(_selectedFile!.name);
+          _originalFileName =
+              path.basenameWithoutExtension(_selectedFile!.name);
         });
         _showInfo('Excel file selected: ${_selectedFile!.name}');
       }
@@ -141,158 +138,129 @@ class _MainScreenState extends State<MainScreen> {
       _showError('Please select an Excel file first');
       return;
     }
-    
-    // Safety check to prevent starting if already processing
+
     if (_isProcessing) {
       _showInfo('Processing is already running.');
       return;
     }
 
     try {
-      // Set processing flag early to disable buttons
       setState(() {
         _isProcessing = true;
       });
 
-      // Read file bytes
       Uint8List? bytes;
       if (_selectedFile!.bytes != null) {
         bytes = _selectedFile!.bytes!;
       } else if (_selectedFile!.path != null) {
-        // Use File().readAsBytes() as a robust way to get bytes from path
         bytes = await File(_selectedFile!.path!).readAsBytes();
       } else {
         _showError('Cannot read file data');
-        setState(() { _isProcessing = false; });
+        setState(() {
+          _isProcessing = false;
+        });
         return;
       }
-      
-      // Load and parse data (will happen on the main thread, but is async)
+
+      // Load data
       await _loadDataFromExcel(bytes);
 
-      // Only start checking if usernames were successfully loaded
       if (_usernames.isNotEmpty) {
         await _startProcessing();
       } else {
         _showError('No valid usernames to process.');
-        setState(() { _isProcessing = false; });
+        setState(() {
+          _isProcessing = false;
+        });
       }
-
     } catch (e) {
       _showError('Error processing Excel file: $e');
-      setState(() { _isProcessing = false; });
+      setState(() {
+        _isProcessing = false;
+      });
     }
   }
 
-  /// FIX: This method has been refactored for robustness to avoid the
-  /// "Null check operator used on a null value" error when reading Excel cells.
+  /// FIXED: Robust Excel Loader (Prevents Null Check Crash)
   Future<void> _loadDataFromExcel(Uint8List bytes) async {
-    _resetStats(); // Clear previous results before loading new data
+    _resetStats();
     try {
-      // Decode the Excel file bytes
       var excelFile = excel.Excel.decodeBytes(bytes);
 
-      // FIX 1: Safely access the first sheet
-      final sheetName = excelFile.tables.keys.firstWhere(
-        (k) => excelFile.tables[k] != null,
-        orElse: () => throw Exception('No sheets found in Excel file'),
-      );
-      var sheet = excelFile.tables[sheetName]!; // Now it's safe to use '!' since we checked for it
-      
-      if (sheet.maxRows == 0) {
-        throw Exception('No sheets or data found in Excel file');
+      if (excelFile.tables.isEmpty) {
+        throw Exception('No sheets found in Excel file');
       }
 
-      // --- LOGIC FIX: Find the username column (Header check first) ---
+      // Safe access to the first table
+      var table = excelFile.tables[excelFile.tables.keys.first];
+      if (table == null || table.maxRows == 0) {
+        throw Exception('Sheet is empty');
+      }
+
       int usernameColumnIndex = -1;
       List<String> headers = [];
-      
-      // Get headers from first row (Row 0)
-      var headerRow = sheet.rows.isNotEmpty ? sheet.rows[0] : [];
-      
-      // FIX 2: Check for null cell before accessing value
+
+      // Safe Header Processing
+      var headerRow = table.rows.isNotEmpty ? table.rows[0] : [];
       for (int j = 0; j < headerRow.length; j++) {
         var cell = headerRow[j];
-        String headerText = '';
-        if (cell != null && cell.value != null) {
-          // Safely get the string value from CellValue
-          headerText = cell.value.toString().trim().toLowerCase();
-        }
-        
-        headers.add(headerText.toUpperCase()); // Store uppercase for consistent map keys
-        if (headerText == 'username') {
+        // FIX: Check for null cell and null value
+        String headerText = (cell?.value ?? '').toString().trim();
+        headers.add(headerText.toUpperCase());
+        if (headerText.toLowerCase().contains('username') || 
+            headerText.toLowerCase() == 'user') {
           usernameColumnIndex = j;
         }
       }
 
-      // Bug Fix/New Logic: If 'username' header not found, default to the first column (index 0)
       if (usernameColumnIndex == -1) {
         usernameColumnIndex = 0;
-        _showInfo('No "username" column header found. Defaulting to the first column (index 0).');
+        _showInfo('No "username" header found. Using first column.');
       }
 
       _usernames.clear();
       _allExcelData.clear();
 
-      // Process all data rows (starting from Row 1)
-      for (int i = 1; i < sheet.rows.length; i++) {
-        var row = sheet.rows[i];
-        if (row.isEmpty) continue; // Skip entirely empty rows
+      // Process Rows safely
+      for (int i = 1; i < table.rows.length; i++) {
+        var row = table.rows[i];
+        if (row.isEmpty) continue;
 
         Map<String, dynamic> rowData = {};
         String username = '';
 
-        // Extract all data from the row
         for (int j = 0; j < headers.length; j++) {
           String key = headers[j];
-          // FIX 3: Safely check column bounds
-          var cell = j < row.length ? row[j] : null; 
-          
-          if (cell != null && cell.value != null) {
-            // FIX 4: Use safe check instead of '!'
-            rowData[key] = cell.value.toString(); 
-          } else {
-            rowData[key] = '';
-          }
+          // FIX: Check bounds (row might be shorter than headers)
+          var cell = (j < row.length) ? row[j] : null;
+          rowData[key] = (cell?.value ?? '').toString();
         }
-        
-        // Get username from the identified column
-        var usernameCell = usernameColumnIndex < row.length ? row[usernameColumnIndex] : null;
 
-        if (usernameCell != null && usernameCell.value != null) {
-          // FIX 5: Use safe check instead of '!'
-          username = usernameCell.value.toString().trim(); 
-        }
-        
-        if (username.isNotEmpty) {
+        // Get Username safely
+        var usernameCell = (usernameColumnIndex < row.length) ? row[usernameColumnIndex] : null;
+        username = (usernameCell?.value ?? '').toString().trim();
+
+        if (username.isNotEmpty && username.toLowerCase() != 'null') {
           _usernames.add(username);
           _allExcelData.add(rowData);
         }
       }
 
       if (_usernames.isEmpty) {
-        throw Exception('No valid usernames found in Excel file');
+        throw Exception('No valid usernames found (checked ${_allExcelData.length} rows)');
       }
 
-      _showInfo('Loaded ${_usernames.length} rows from Excel');
+      _showInfo('Loaded ${_usernames.length} rows');
     } catch (e) {
-      _showError('Error loading data from Excel: ${e.toString()}');
-      rethrow;
+      // Re-throw to be caught by caller
+      throw Exception('Excel Load Error: $e');
     }
   }
 
   Future<void> _startProcessing() async {
-    if (_usernames.isEmpty) {
-      // Already checked, but good to have
-      _showError('No valid usernames found');
-      setState(() { _isProcessing = false; });
-      return;
-    }
+    if (_usernames.isEmpty) return;
 
-    _resetStats(); // Reset stats again before starting the HTTP process
-    
-    // Note: _isProcessing is already set to true in _startProcessingFromExcel
-
+    _resetStats();
     _canceller = Completer();
     _semaphore = Semaphore(concurrentLimit);
     final client = http.Client();
@@ -302,30 +270,26 @@ class _MainScreenState extends State<MainScreen> {
       for (int i = 0; i < _usernames.length; i++) {
         final username = _usernames[i];
         final rowData = _allExcelData[i];
-        
-        // Use Future.microtask to queue the semaphore acquisition for better scheduling
+
         futures.add(Future.microtask(() => _processWithSemaphore(() async {
-          if (_canceller!.isCompleted) {
-             // Increment cancelled count if processing stops before execution
-             _updateResult('CANCELLED', 'Cancelled: $username', username);
-             return;
-          }
-          await _checkUsername(client, username, rowData);
-        })));
+              if (_canceller!.isCompleted) {
+                _updateResult('CANCELLED', 'Cancelled: $username', username);
+                return;
+              }
+              await _checkUsername(client, username, rowData);
+            })));
       }
 
-      // Wait for all checks to complete or the process to be cancelled
       await Future.wait(futures);
-      
-      // Update UI state only if not explicitly cancelled
+
       if (!_canceller!.isCompleted) {
         setState(() {
           _isProcessing = false;
         });
-        _showSuccess('Processing completed! Found $_activeCount active accounts.');
+        _showSuccess(
+            'Processing completed! Found $_activeCount active accounts.');
       }
     } catch (e) {
-      // Catch-all for unexpected errors during Future.wait
       _showError('Processing error: $e');
       setState(() {
         _isProcessing = false;
@@ -336,84 +300,62 @@ class _MainScreenState extends State<MainScreen> {
   }
 
   Future<void> _processWithSemaphore(Future<void> Function() task) async {
-    // Ensure semaphore is not null before acquiring
     if (_semaphore == null) return;
-
     await _semaphore!.acquire();
     try {
       await task();
     } finally {
-      // Ensure release is always called
       await _semaphore!.release();
     }
   }
 
-  Future<void> _checkUsername(http.Client client, String username, Map<String, dynamic> rowData) async {
-    final url = Uri.parse('https://i.instagram.com/api/v1/users/web_profile_info/?username=$username');
+  Future<void> _checkUsername(http.Client client, String username,
+      Map<String, dynamic> rowData) async {
+    final url = Uri.parse(
+        'https://i.instagram.com/api/v1/users/web_profile_info/?username=$username');
     int retryCount = 0;
     double delayMs = initialDelay.toDouble();
 
     while (retryCount < maxRetries) {
-      if (_canceller!.isCompleted) {
-        // If cancelled, ensure the final result is recorded
-        _updateResult('CANCELLED', 'Cancelled: $username', username);
-        return;
-      }
+      if (_canceller!.isCompleted) return;
 
       try {
         final response = await client.get(url, headers: _headers).timeout(
-          const Duration(seconds: 30),
-        );
-        
+              const Duration(seconds: 15),
+            );
+
         final code = response.statusCode;
 
         if (code == 404) {
-          // 404 Not Found typically means the account is available/not registered
-          _updateResult('AVAILABLE', '$username - Available', username);
+          _updateResult('AVAILABLE', '$username - Not Found', username);
           return;
         } else if (code == 200) {
-          // Success: Analyze the body
           try {
             final jsonBody = jsonDecode(response.body);
-            // Check for the presence of the user object in the response data
             final hasUser = jsonBody['data']?['user'] != null;
-            
+
             if (hasUser) {
               _updateResult('ACTIVE', '$username - Active', username);
-              // Add the complete row data for active accounts
               _activeAccounts.add(rowData);
             } else {
-              // Sometimes 200 might return no user data for other reasons (e.g., private API key issue, or another form of availability)
-              _updateResult('AVAILABLE', '$username - Available (No User Data)', username);
+              _updateResult('AVAILABLE', '$username - No Data', username);
             }
           } catch (e) {
-            // JSON parsing error (e.g., malformed response body)
-            _updateResult('ERROR', '$username - JSON Parse Error', username);
+             // Sometimes 200 OK returns HTML if blocked, treat as error or retry
+             _updateResult('ERROR', '$username - Parse Error', username);
           }
           return;
         } else if (code == 429) {
-          // Rate limited: increase backoff
-          delayMs = min(maxDelay.toDouble(), delayMs * 2 + Random().nextInt(1000));
+          // Rate Limit
+          delayMs = min(maxDelay.toDouble(), delayMs * 2);
           retryCount++;
-          _updateStatus('Rate limited for $username, waiting ${delayMs.toInt()}ms...', username);
+          _updateStatus('Rate Limit $username. Waiting...', username);
         } else {
-          // Other unexpected statuses (e.g., 500 server error): backoff + retry
-          delayMs = min(maxDelay.toDouble(), delayMs * 2 + Random().nextInt(1000));
+          delayMs = min(maxDelay.toDouble(), delayMs * 1.5);
           retryCount++;
-          _updateStatus('Retry $retryCount/$maxRetries for $username (Status: $code)', username);
         }
-      } on TimeoutException {
-        // Network timeout: backoff + retry
-        delayMs = min(maxDelay.toDouble(), delayMs * 2 + Random().nextInt(1000));
-        retryCount++;
-        _updateStatus('Retry $retryCount/$maxRetries for $username (Timeout)', username);
       } catch (e) {
-        // General network/IO error -> backoff + retry
-        delayMs = min(maxDelay.toDouble(), delayMs * 2 + Random().nextInt(1000));
         retryCount++;
-        final errorMsg = e.toString();
-        final shortMsg = errorMsg.length > 50 ? '${errorMsg.substring(0, 47)}...' : errorMsg;
-        _updateStatus('Retry $retryCount/$maxRetries for $username ($shortMsg)', username);
       }
 
       if (retryCount < maxRetries) {
@@ -421,52 +363,38 @@ class _MainScreenState extends State<MainScreen> {
       }
     }
 
-    // If loop finishes without returning, max retries were exceeded
-    _updateResult('ERROR', '$username - Max retries exceeded', username);
+    _updateResult('ERROR', '$username - Failed', username);
   }
 
   void _updateResult(String status, String message, String username) {
-    if (mounted) {
-      setState(() {
-        _processedCount++;
-        switch (status) {
-          case 'ACTIVE':
-            _activeCount++;
-            break;
-          case 'AVAILABLE':
-            _availableCount++;
-            break;
-          case 'ERROR':
-            _errorCount++;
-            break;
-          case 'CANCELLED':
-            // Only increment if it wasn't already processed (a potential bug fix)
-            if (_usernames.length > _processedCount + _activeCount + _availableCount + _errorCount) {
-                _cancelledCount++;
-            }
-            break;
-        }
-        _results.insert(0, ResultItem(status, message));
-        
-        // Keep only last 100 results to prevent memory issues in the UI log
-        if (_results.length > 100) {
-          _results.removeLast();
-        }
-      });
-    }
+    if (!mounted) return;
+    setState(() {
+      _processedCount++;
+      switch (status) {
+        case 'ACTIVE':
+          _activeCount++;
+          break;
+        case 'AVAILABLE':
+          _availableCount++;
+          break;
+        case 'ERROR':
+          _errorCount++;
+          break;
+        case 'CANCELLED':
+           // Handled in batch usually
+          break;
+      }
+      _results.insert(0, ResultItem(status, message));
+      if (_results.length > 200) _results.removeLast();
+    });
   }
 
   void _updateStatus(String message, String username) {
-    if (mounted) {
-      // Use setState to update the log with INFO messages
-      setState(() {
-        _results.insert(0, ResultItem('INFO', message));
-        // Keep a larger buffer for temporary status logs
-        if (_results.length > 1000) {
-          _results.removeLast();
-        }
-      });
-    }
+    if (!mounted) return;
+    setState(() {
+      _results.insert(0, ResultItem('INFO', message));
+      if (_results.length > 200) _results.removeLast();
+    });
   }
 
   void _resetStats() {
@@ -477,31 +405,38 @@ class _MainScreenState extends State<MainScreen> {
     _cancelledCount = 0;
     _activeAccounts.clear();
     _results.clear();
-    // Only call setState if we are actually mounted, though the caller should handle this
-    if(mounted) {
-      setState(() {});
-    }
+    if (mounted) setState(() {});
   }
 
   void _cancelProcessing() {
-    // Complete the canceller to signal all running tasks to stop
     if (!(_canceller?.isCompleted ?? true)) {
       _canceller?.complete();
     }
-    // Release all waiting tasks in the semaphore to unblock Future.wait
-    _semaphore?.releaseAll(); // Add a releaseAll method to Semaphore for clean shutdown
-    
-    // Calculate the number of items that weren't processed before cancellation
-    int unaccounted = _usernames.length - (_processedCount + _activeCount + _availableCount + _errorCount + _cancelledCount);
-    if (unaccounted > 0) {
-      _cancelledCount += unaccounted;
-    }
-
-
+    _semaphore?.releaseAll();
     setState(() {
       _isProcessing = false;
     });
-    _showInfo('Processing cancelled. $_cancelledCount usernames were not checked.');
+    _showInfo('Processing cancelled.');
+  }
+
+  /// FIXED: Permission Handling and Path Creation
+  Future<bool> _requestStoragePermission() async {
+    // Android 11+ (API 30+) needs minimal permissions for public folders like Downloads
+    // Android 10 and below needs strict Storage permission
+    if (Platform.isAndroid) {
+        // Try requesting storage permission first
+        var status = await Permission.storage.request();
+        if (status.isGranted) return true;
+        
+        // If Android 13+, Manage External Storage might be needed for root, 
+        // but we will use public Downloads folder to avoid rejection.
+        // Checking for manageExternalStorage is dangerous for Play Store apps unless valid use case.
+        if (await Permission.storage.isPermanentlyDenied) {
+           openAppSettings();
+           return false;
+        }
+    }
+    return true;
   }
 
   Future<void> _downloadResults() async {
@@ -510,82 +445,106 @@ class _MainScreenState extends State<MainScreen> {
       return;
     }
 
+    // 1. Request Permission
+    // On Android 13+, explicit storage permission might not be needed for getExternalStoragePublicDirectory(Downloads)
+    // but good to check basic permissions.
+    await _requestStoragePermission();
+
     try {
-      final timestamp = DateTime.now().toIso8601String().replaceAll(RegExp(r'[:.]'), '');
-      final fileName = 'active_accounts_${_originalFileName}_$timestamp.xlsx';
+      final timestamp = DateTime.now()
+          .toIso8601String()
+          .replaceAll(RegExp(r'[:.]'), '');
+      final fileName = 'active_${_originalFileName}_$timestamp.xlsx';
+
+      // 2. FIXED: Determine Safe Save Path
+      String? savePath;
       
-      // FIX: Use path_provider for robust, cross-platform saving location
-      // Get the external storage directory (usually Download on Android)
-      final Directory? externalDir = await getExternalStorageDirectory();
-      // Use the root of external storage or getApplicationDocumentsDirectory as fallback
-      // Note: This root directory access might require specific permissions on newer Android versions.
-      // For simplicity, we use the documents directory as a safe default fallback.
-      final Directory baseDir = externalDir?.parent.parent.parent.parent ?? await getApplicationDocumentsDirectory(); 
-      final Directory saveDir = Directory(path.join(baseDir.path, 'insta_saver'));
-      
+      if (Platform.isAndroid) {
+        // Try to get the public Download directory
+        final directory = await getExternalStorageDirectory(); // App specific
+        // OR Use this for public downloads (may require permissions on older android)
+        // Directory('/storage/emulated/0/Download'); 
+        
+        // Strategy: Save to App Documents (guaranteed success) or Downloads
+        Directory? downloadDir;
+        try {
+           downloadDir = Directory('/storage/emulated/0/Download');
+           if (!await downloadDir.exists()) {
+             downloadDir = await getExternalStorageDirectory();
+           }
+        } catch (e) {
+           downloadDir = await getApplicationDocumentsDirectory();
+        }
+        
+        savePath = path.join(downloadDir!.path, 'InstaCheck_Results');
+      } else {
+        final directory = await getApplicationDocumentsDirectory();
+        savePath = directory.path;
+      }
+
+      final saveDir = Directory(savePath);
       if (!await saveDir.exists()) {
         await saveDir.create(recursive: true);
       }
-      
+
       final filePath = path.join(saveDir.path, fileName);
-      
-      // Create Excel workbook
+
+      // 3. Create Excel
       var excelFile = excel.Excel.createExcel();
-      // Remove default sheet
-      excelFile.getDefaultSheet() != null ? excelFile.delete('Sheet1') : null;
-      excel.Sheet sheet = excelFile.sheets['Active Accounts'] ?? excelFile['Active Accounts'];
-
-      // Add headers
+      // Remove default sheet safely
+      if(excelFile.sheets.containsKey('Sheet1')) {
+         excelFile.delete('Sheet1');
+      }
+      
+      excel.Sheet sheet = excelFile['Active Accounts'];
+      
       if (_activeAccounts.isNotEmpty) {
-        // Use the keys of the first row to determine the headers
-        sheet.appendRow(_activeAccounts[0].keys.map((key) => excel.TextCellValue(key.toUpperCase())).toList());
+        sheet.appendRow(_activeAccounts[0]
+            .keys
+            .map((key) => excel.TextCellValue(key.toUpperCase()))
+            .toList());
       }
-
-      // Add data rows
       for (var row in _activeAccounts) {
-        // Ensure all data is written as TextCellValue for consistency
-        sheet.appendRow(row.values.map((value) => excel.TextCellValue(value.toString())).toList());
+        sheet.appendRow(row.values
+            .map((value) => excel.TextCellValue(value.toString()))
+            .toList());
       }
 
-      // Save Excel file
       final excelBytes = excelFile.encode();
       if (excelBytes != null) {
-        await File(filePath).writeAsBytes(excelBytes);
-        _showSuccess('Results saved to ${saveDir.path}/$fileName (${_activeAccounts.length} active accounts)');
+        File(filePath)
+          ..createSync(recursive: true)
+          ..writeAsBytesSync(excelBytes);
+        _showSuccess('Saved to: $filePath');
       } else {
         _showError('Failed to encode Excel file');
       }
     } catch (e) {
-      _showError('Error saving results: ${e.toString()}');
+      _showError('Error saving: $e');
     }
   }
 
-  // Utility Methods (No changes here, they are fine)
   void _showSuccess(String message) {
     Fluttertoast.showToast(
       msg: message,
-      toastLength: Toast.LENGTH_LONG,
-      gravity: ToastGravity.BOTTOM,
       backgroundColor: Colors.green,
       textColor: Colors.white,
+      toastLength: Toast.LENGTH_LONG,
     );
   }
 
   void _showError(String message) {
     Fluttertoast.showToast(
       msg: message,
-      toastLength: Toast.LENGTH_LONG,
-      gravity: ToastGravity.BOTTOM,
       backgroundColor: Colors.red,
       textColor: Colors.white,
+      toastLength: Toast.LENGTH_LONG,
     );
   }
 
   void _showInfo(String message) {
     Fluttertoast.showToast(
       msg: message,
-      toastLength: Toast.LENGTH_SHORT,
-      gravity: ToastGravity.BOTTOM,
       backgroundColor: Colors.blue,
       textColor: Colors.white,
     );
@@ -593,27 +552,13 @@ class _MainScreenState extends State<MainScreen> {
 
   @override
   Widget build(BuildContext context) {
-    // ... (UI code remains the same as it was functional)
     return Scaffold(
-      backgroundColor: const Color(0xFFF9FAFB),
       appBar: AppBar(
-        title: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Icon(Icons.camera_alt, color: Colors.pink[400]),
-            const SizedBox(width: 8),
-            const Text(
-              'Instagram Username Checker',
-              style: TextStyle(
-                fontWeight: FontWeight.bold,
-                color: Color(0xFF4F46E5),
-              ),
-            ),
-          ],
+        title: const Text(
+          'Insta Checker Fixed',
+          style: TextStyle(color: Color(0xFF4F46E5), fontWeight: FontWeight.bold),
         ),
         centerTitle: true,
-        backgroundColor: Colors.white,
-        elevation: 0,
       ),
       body: SafeArea(
         child: Container(
@@ -623,18 +568,16 @@ class _MainScreenState extends State<MainScreen> {
             borderRadius: BorderRadius.circular(16),
             boxShadow: [
               BoxShadow(
-                color: Colors.grey.withOpacity(0.1),
-                spreadRadius: 1,
-                blurRadius: 10,
-                offset: const Offset(0, 1),
-              ),
+                  color: Colors.black.withOpacity(0.05),
+                  blurRadius: 10,
+                  offset: const Offset(0, 5))
             ],
           ),
           child: Column(
             children: [
               Expanded(
                 child: SingleChildScrollView(
-                  padding: const EdgeInsets.fromLTRB(16, 16, 16, 16),
+                  padding: const EdgeInsets.all(16),
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.stretch,
                     children: [
@@ -655,304 +598,116 @@ class _MainScreenState extends State<MainScreen> {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        const Text(
-          'Import Excel File',
-          style: TextStyle(
-            fontSize: 18,
-            fontWeight: FontWeight.bold,
-            color: Color(0xFF4F46E5),
-          ),
-        ),
+        const Text('Import Excel',
+            style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
         const SizedBox(height: 8),
-        Text(
-          'Upload an Excel file with a "username" column to check Instagram accounts. All data will be preserved for active accounts.',
-          style: TextStyle(fontSize: 14, color: Colors.grey[600]),
-        ),
+        Text('Select an Excel file with a "username" column.',
+            style: TextStyle(color: Colors.grey[600])),
         const SizedBox(height: 16),
         ElevatedButton.icon(
           onPressed: _isProcessing ? null : _pickExcelFile,
-          icon: _selectedFile != null
-              ? const Icon(Icons.check_circle, color: Colors.green)
-              : const Icon(Icons.attach_file),
-          label: Text(_selectedFile?.name ?? 'Pick Excel File'),
+          icon: Icon(_selectedFile != null ? Icons.check : Icons.upload_file),
+          label: Text(_selectedFile?.name ?? 'Select File'),
           style: ElevatedButton.styleFrom(
-            backgroundColor: _selectedFile != null ? Colors.green[50] : const Color(0xFF4F46E5),
-            foregroundColor: _selectedFile != null ? Colors.green[700] : Colors.white,
-            minimumSize: const Size(double.infinity, 48),
+            backgroundColor: _selectedFile != null
+                ? Colors.green[100]
+                : const Color(0xFF4F46E5),
+            foregroundColor:
+                _selectedFile != null ? Colors.green[800] : Colors.white,
           ),
         ),
-        const SizedBox(height: 16),
-        ElevatedButton.icon(
-          onPressed: _isProcessing ? null : _startProcessingFromExcel,
-          icon: const Icon(Icons.search),
-          label: const Text('Start Checking'),
-          style: ElevatedButton.styleFrom(
-            backgroundColor: Colors.red[600],
-            foregroundColor: Colors.white,
-            minimumSize: const Size(double.infinity, 48),
+        const SizedBox(height: 8),
+        if (_selectedFile != null)
+          ElevatedButton.icon(
+            onPressed: _isProcessing ? null : _startProcessingFromExcel,
+            icon: const Icon(Icons.play_arrow),
+            label: const Text('Start Checking'),
+            style: ElevatedButton.styleFrom(backgroundColor: Colors.redAccent, foregroundColor: Colors.white),
           ),
-        ),
       ],
     );
   }
 
   List<Widget> _buildResultsUI() {
-    // Show results section only if a file is selected or there are results to show
-    if (_selectedFile == null && _usernames.isEmpty) {
-        return [const SizedBox.shrink()];
-    }
+    int total = _usernames.length;
+    double percent = total == 0 ? 0 : (_processedCount / total);
 
-    final totalUsernames = _usernames.length;
-    final processedTotal = _processedCount + _cancelledCount;
-    final percentage = totalUsernames > 0 ? (processedTotal * 100 / totalUsernames) : 0.0;
-    
     return [
-      const SizedBox(height: 24),
-      const Text(
-        'Progress',
-        style: TextStyle(
-          fontSize: 16,
-          fontWeight: FontWeight.bold,
-          color: Color(0xFF4F46E5),
-        ),
-      ),
-      const SizedBox(height: 12),
-      Container(
-        height: 8,
-        decoration: BoxDecoration(
-          color: Colors.grey[200],
-        ),
-        child: FractionallySizedBox(
-          alignment: Alignment.centerLeft,
-          widthFactor: percentage / 100,
-          child: Container(
-            decoration: BoxDecoration(
-              color: Colors.green[600],
-            ),
-          ),
-        ),
-      ),
-      const SizedBox(height: 8),
-      Text(
-        'Processed: $processedTotal/$totalUsernames (${percentage.toStringAsFixed(1)}%)',
-        style: TextStyle(fontSize: 12, color: Colors.grey[600]),
-        textAlign: TextAlign.center,
-      ),
-      const SizedBox(height: 16),
+      const SizedBox(height: 20),
+      LinearProgressIndicator(value: percent, minHeight: 10, backgroundColor: Colors.grey[200]),
+      const SizedBox(height: 10),
+      Text('Processed: $_processedCount / $total', textAlign: TextAlign.center),
+      const SizedBox(height: 20),
       Row(
         children: [
-          Expanded(child: _buildStatCard('Active', _activeCount.toString(), Colors.red[50]!, Colors.red[600]!)),
-          const SizedBox(width: 12),
-          Expanded(child: _buildStatCard('Available', _availableCount.toString(), Colors.green[50]!, Colors.green[700]!)),
+          Expanded(child: _statCard('Active', '$_activeCount', Colors.green[100]!)),
+          const SizedBox(width: 8),
+          Expanded(child: _statCard('Invalid', '$_availableCount', Colors.orange[100]!)),
         ],
       ),
-      const SizedBox(height: 8),
-      Row(
-        children: [
-          Expanded(child: _buildStatCard('Error/Cancelled', (_errorCount + _cancelledCount).toString(), Colors.orange[50]!, Colors.orange[700]!)),
-          const SizedBox(width: 12),
-          Expanded(child: _buildStatCard('Total Loaded', totalUsernames.toString(), Colors.blue[50]!, Colors.blue[700]!)),
-        ],
-      ),
-      const SizedBox(height: 16),
-      if (_isProcessing)
-        ElevatedButton.icon(
-          onPressed: _cancelProcessing,
-          icon: const Icon(Icons.close),
-          label: const Text('Cancel'),
-          style: ElevatedButton.styleFrom(
-            backgroundColor: Colors.red[600],
-            foregroundColor: Colors.white,
-            minimumSize: const Size(double.infinity, 48),
-          ),
-        ),
-      if (!_isProcessing && _activeAccounts.isNotEmpty)
+      const SizedBox(height: 20),
+      if (!_isProcessing && _activeCount > 0)
         ElevatedButton.icon(
           onPressed: _downloadResults,
           icon: const Icon(Icons.download),
-          label: Text('Download Active Accounts (${_activeAccounts.length})'),
-          style: ElevatedButton.styleFrom(
-            backgroundColor: Colors.green[600],
-            foregroundColor: Colors.white,
-            minimumSize: const Size(double.infinity, 48),
+          label: const Text('Download Active Accounts'),
+          style: ElevatedButton.styleFrom(backgroundColor: Colors.green, foregroundColor: Colors.white),
+        ),
+      if (_isProcessing)
+        ElevatedButton.icon(
+           onPressed: _cancelProcessing,
+           icon: const Icon(Icons.stop),
+           label: const Text('Stop Processing'),
+           style: ElevatedButton.styleFrom(backgroundColor: Colors.grey),
+        ),
+        
+      const SizedBox(height: 10),
+      Container(
+        height: 200,
+        decoration: BoxDecoration(border: Border.all(color: Colors.grey[300]!)),
+        child: ListView.builder(
+          itemCount: _results.length,
+          itemBuilder: (c, i) => Container(
+            padding: const EdgeInsets.symmetric(vertical: 4, horizontal: 8),
+            color: _results[i].status == 'ACTIVE' ? Colors.green[50] : Colors.white,
+            child: Text(_results[i].message, style: const TextStyle(fontSize: 12)),
           ),
         ),
-      const SizedBox(height: 16),
-      const Text(
-        'Results Log',
-        style: TextStyle(
-          fontSize: 16,
-          fontWeight: FontWeight.bold,
-          color: Color(0xFF4F46E5),
-        ),
-      ),
-      const SizedBox(height: 8),
-      Container(
-        constraints: const BoxConstraints(maxHeight: 300),
-        decoration: BoxDecoration(
-          border: Border.all(color: Colors.grey[300]!),
-          borderRadius: BorderRadius.circular(8),
-        ),
-        child: ListView.builder(
-          shrinkWrap: true,
-          itemCount: _results.length,
-          itemBuilder: (context, index) {
-            final item = _results[index];
-            return Container(
-              margin: const EdgeInsets.only(bottom: 1), // Minimal margin for log look
-              padding: const EdgeInsets.all(12),
-              decoration: BoxDecoration(
-                color: _getBackgroundColor(item.status),
-                // Only show border on status change or for visual effect
-                border: Border(bottom: BorderSide(color: Colors.grey[200]!)), 
-              ),
-              child: Row(
-                children: [
-                  Icon(
-                    _getIcon(item.status),
-                    color: _getTextColor(item.status),
-                    size: 16,
-                  ),
-                  const SizedBox(width: 12),
-                  Expanded(
-                    child: Text(
-                      item.message,
-                      style: TextStyle(
-                        color: _getTextColor(item.status),
-                        fontSize: 12,
-                        fontWeight: FontWeight.w500,
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-            );
-          },
-        ),
-      ),
+      )
     ];
   }
 
-  Widget _buildStatCard(String label, String value, Color backgroundColor, Color textColor) {
+  Widget _statCard(String label, String value, Color color) {
     return Container(
       padding: const EdgeInsets.all(12),
-      decoration: BoxDecoration(
-        color: backgroundColor,
-        borderRadius: BorderRadius.circular(8),
-        border: Border.all(color: textColor.withOpacity(0.2)),
-      ),
+      decoration: BoxDecoration(color: color, borderRadius: BorderRadius.circular(8)),
       child: Column(
         children: [
-      Text(
-        value,
-        style: TextStyle(
-          fontSize: 20,
-          fontWeight: FontWeight.bold,
-          color: textColor,
-        ),
-      ),
-      const SizedBox(height: 4),
-      Text(
-        label,
-        style: TextStyle(
-          fontSize: 12,
-          color: textColor.withOpacity(0.8),
-        ),
-      ),
+          Text(value, style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
+          Text(label, style: const TextStyle(fontSize: 12)),
         ],
       ),
     );
-  }
-
-  // ... (Helper methods for UI coloring/icons remain the same)
-  IconData _getIcon(String status) {
-    switch (status) {
-      case 'ACTIVE':
-        return Icons.verified_user;
-      case 'AVAILABLE':
-        return Icons.person_add;
-      case 'ERROR':
-        return Icons.error;
-      case 'CANCELLED':
-        return Icons.cancel;
-      case 'INFO':
-        return Icons.info;
-      default:
-        return Icons.help;
-    }
-  }
-
-  Color _getBackgroundColor(String status) {
-    switch (status) {
-      case 'ACTIVE':
-        return Colors.red[50]!;
-      case 'AVAILABLE':
-        return Colors.green[50]!;
-      case 'ERROR':
-        return Colors.orange[50]!;
-      case 'CANCELLED':
-        return Colors.grey[50]!;
-      case 'INFO':
-        return Colors.blue[50]!;
-      default:
-        return Colors.grey[50]!;
-    }
-  }
-
-  Color _getBorderColor(String status) {
-    switch (status) {
-      case 'ACTIVE':
-        return Colors.red[100]!;
-      case 'AVAILABLE':
-        return Colors.green[100]!;
-      case 'ERROR':
-        return Colors.orange[100]!;
-      case 'CANCELLED':
-        return Colors.grey[100]!;
-      case 'INFO':
-        return Colors.blue[100]!;
-      default:
-        return Colors.grey[100]!;
-    }
-  }
-
-  Color _getTextColor(String status) {
-    switch (status) {
-      case 'ACTIVE':
-        return Colors.red[700]!;
-      case 'AVAILABLE':
-        return Colors.green[700]!;
-      case 'ERROR':
-        return Colors.orange[700]!;
-      case 'CANCELLED':
-        return Colors.grey[700]!;
-      case 'INFO':
-        return Colors.blue[700]!;
-      default:
-        return Colors.grey[700]!;
-    }
   }
 }
 
 class ResultItem {
   final String status;
   final String message;
-
   ResultItem(this.status, this.message);
 }
 
-// FIX: Added releaseAll to the custom Semaphore for clean cancellation
+// Fixed Semaphore Implementation
 class Semaphore {
   int _permits;
   final Queue<Completer<void>> _waiters = Queue();
   final Lock _lock = Lock();
-  final int _concurrentLimit; // Store the initial limit for reset
+  final int _concurrentLimit;
 
-  Semaphore(int permits) : 
-    _permits = permits,
-    _concurrentLimit = permits;
+  Semaphore(int permits)
+      : _permits = permits,
+        _concurrentLimit = permits;
 
-  /// Acquire a permit. If none available, wait until released.
   Future<void> acquire() async {
     Completer<void>? myWaiter;
     await _lock.synchronized(() {
@@ -969,7 +724,6 @@ class Semaphore {
     }
   }
 
-  /// Release a permit; if waiters exist, wake the first.
   Future<void> release() async {
     await _lock.synchronized(() {
       if (_waiters.isNotEmpty) {
@@ -980,16 +734,13 @@ class Semaphore {
       }
     });
   }
-  
-  /// FIX: Release all waiting futures for clean cancellation.
+
   Future<void> releaseAll() async {
     await _lock.synchronized(() {
       while (_waiters.isNotEmpty) {
         final c = _waiters.removeFirst();
-        // Complete the waiter so Future.wait can resolve.
         c.complete();
       }
-      // Reset permits to the initial limit
       _permits = _concurrentLimit;
     });
   }
