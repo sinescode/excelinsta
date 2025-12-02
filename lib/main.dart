@@ -184,17 +184,22 @@ class _MainScreenState extends State<MainScreen> {
     }
   }
 
-  // Large File/ANR Fix: This method is still on the main thread but is
-  // asynchronous. For truly massive files (100k+ rows), this should be
-  // run in a separate Isolate using compute() to prevent ANR.
+  /// FIX: This method has been refactored for robustness to avoid the
+  /// "Null check operator used on a null value" error when reading Excel cells.
   Future<void> _loadDataFromExcel(Uint8List bytes) async {
     _resetStats(); // Clear previous results before loading new data
     try {
       // Decode the Excel file bytes
       var excelFile = excel.Excel.decodeBytes(bytes);
-      var sheet = excelFile.tables[excelFile.tables.keys.first];
+
+      // FIX 1: Safely access the first sheet
+      final sheetName = excelFile.tables.keys.firstWhere(
+        (k) => excelFile.tables[k] != null,
+        orElse: () => throw Exception('No sheets found in Excel file'),
+      );
+      var sheet = excelFile.tables[sheetName]!; // Now it's safe to use '!' since we checked for it
       
-      if (sheet == null || sheet.maxRows == 0) {
+      if (sheet.maxRows == 0) {
         throw Exception('No sheets or data found in Excel file');
       }
 
@@ -203,10 +208,17 @@ class _MainScreenState extends State<MainScreen> {
       List<String> headers = [];
       
       // Get headers from first row (Row 0)
-      var headerRow = sheet.rows[0];
+      var headerRow = sheet.rows.isNotEmpty ? sheet.rows[0] : [];
+      
+      // FIX 2: Check for null cell before accessing value
       for (int j = 0; j < headerRow.length; j++) {
         var cell = headerRow[j];
-        String headerText = cell != null ? cell.value.toString().trim().toLowerCase() : '';
+        String headerText = '';
+        if (cell != null && cell.value != null) {
+          // Safely get the string value from CellValue
+          headerText = cell.value.toString().trim().toLowerCase();
+        }
+        
         headers.add(headerText.toUpperCase()); // Store uppercase for consistent map keys
         if (headerText == 'username') {
           usernameColumnIndex = j;
@@ -225,22 +237,31 @@ class _MainScreenState extends State<MainScreen> {
       // Process all data rows (starting from Row 1)
       for (int i = 1; i < sheet.rows.length; i++) {
         var row = sheet.rows[i];
+        if (row.isEmpty) continue; // Skip entirely empty rows
+
         Map<String, dynamic> rowData = {};
         String username = '';
 
         // Extract all data from the row
         for (int j = 0; j < headers.length; j++) {
           String key = headers[j];
-          if (j < row.length && row[j] != null) {
-            rowData[key] = row[j]!.value.toString();
+          // FIX 3: Safely check column bounds
+          var cell = j < row.length ? row[j] : null; 
+          
+          if (cell != null && cell.value != null) {
+            // FIX 4: Use safe check instead of '!'
+            rowData[key] = cell.value.toString(); 
           } else {
             rowData[key] = '';
           }
         }
         
         // Get username from the identified column
-        if (row.length > usernameColumnIndex && row[usernameColumnIndex] != null) {
-          username = row[usernameColumnIndex]!.value.toString().trim();
+        var usernameCell = usernameColumnIndex < row.length ? row[usernameColumnIndex] : null;
+
+        if (usernameCell != null && usernameCell.value != null) {
+          // FIX 5: Use safe check instead of '!'
+          username = usernameCell.value.toString().trim(); 
         }
         
         if (username.isNotEmpty) {
@@ -471,8 +492,11 @@ class _MainScreenState extends State<MainScreen> {
     _semaphore?.releaseAll(); // Add a releaseAll method to Semaphore for clean shutdown
     
     // Calculate the number of items that weren't processed before cancellation
-    int unaccounted = _usernames.length - (_processedCount + _cancelledCount);
-    _cancelledCount += unaccounted;
+    int unaccounted = _usernames.length - (_processedCount + _activeCount + _availableCount + _errorCount + _cancelledCount);
+    if (unaccounted > 0) {
+      _cancelledCount += unaccounted;
+    }
+
 
     setState(() {
       _isProcessing = false;
@@ -494,6 +518,8 @@ class _MainScreenState extends State<MainScreen> {
       // Get the external storage directory (usually Download on Android)
       final Directory? externalDir = await getExternalStorageDirectory();
       // Use the root of external storage or getApplicationDocumentsDirectory as fallback
+      // Note: This root directory access might require specific permissions on newer Android versions.
+      // For simplicity, we use the documents directory as a safe default fallback.
       final Directory baseDir = externalDir?.parent.parent.parent.parent ?? await getApplicationDocumentsDirectory(); 
       final Directory saveDir = Directory(path.join(baseDir.path, 'insta_saver'));
       
@@ -512,7 +538,7 @@ class _MainScreenState extends State<MainScreen> {
       // Add headers
       if (_activeAccounts.isNotEmpty) {
         // Use the keys of the first row to determine the headers
-        sheet.appendRow(_activeAccounts[0].keys.map((key) => excel.TextCellValue(key)).toList());
+        sheet.appendRow(_activeAccounts[0].keys.map((key) => excel.TextCellValue(key.toUpperCase())).toList());
       }
 
       // Add data rows
@@ -920,8 +946,11 @@ class Semaphore {
   int _permits;
   final Queue<Completer<void>> _waiters = Queue();
   final Lock _lock = Lock();
+  final int _concurrentLimit; // Store the initial limit for reset
 
-  Semaphore(this._permits);
+  Semaphore(int permits) : 
+    _permits = permits,
+    _concurrentLimit = permits;
 
   /// Acquire a permit. If none available, wait until released.
   Future<void> acquire() async {
@@ -957,14 +986,11 @@ class Semaphore {
     await _lock.synchronized(() {
       while (_waiters.isNotEmpty) {
         final c = _waiters.removeFirst();
-        // Complete with an error or just complete. Completing is simpler.
+        // Complete the waiter so Future.wait can resolve.
         c.complete();
       }
       // Reset permits to the initial limit
-      _permits = concurrentLimit;
+      _permits = _concurrentLimit;
     });
   }
-  
-  // Need the concurrent limit in Semaphore as well
-  static const int concurrentLimit = 5;
 }
